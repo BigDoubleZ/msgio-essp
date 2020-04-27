@@ -2,7 +2,9 @@
 use strict;
 use warnings FATAL => 'all';
 
-use Net::RabbitMQ;
+# use Net::RabbitMQ;
+use Net::AMQP::RabbitMQ::PP;
+
 use Mojo::Pg;
 use Mojo::JSON qw(decode_json encode_json);
 use Email::MIME;
@@ -60,10 +62,17 @@ sub serve {
 sub process {
 
     my $rv = {};
-    $mq->consume($channel, $queue, { no_ack => 0, });
-    $rv = $mq->recv();
 
-    my $data = decode_json($rv->{body});
+    $mq->basic_consume(
+        channel => $channel,
+        queue   => $queue,
+        no_ack  => 0,
+    );
+
+    $rv = $mq->receive();
+    _log(Dumper($rv));
+
+    my $data = decode_json($rv->{payload});
     _log("[ ] task: received: [$data->{id}]");
     my $res;
     eval {
@@ -80,7 +89,11 @@ sub process {
         _log("[!] db: error: $@");
         return;
     }
-    $mq->ack($channel, $rv->{delivery_tag}, 0);
+    $mq->basic_ack(
+        channel      => $channel,
+        delivery_tag => $rv->{delivery_frame}{method_frame}{delivery_tag},
+        multiple     => 0
+    );
 
     my $posts_completed = post($data);
     if (defined $posts_completed) {
@@ -110,33 +123,35 @@ sub prepare_db {
 sub prepare_mq {
     my $r;
     eval {
-        $r = Net::RabbitMQ->new;
+        # $r = Net::RabbitMQ->new;
+        $r = Net::AMQP::RabbitMQ::PP->new;
 
         my @fields = $mq_url =~ RE_MQ_URL;
         return undef if scalar @fields < 3;
 
-        $r->connect($fields[HOST], {
+        $r->connect(
+            host        => $fields[HOST],
             user        => $fields[USER],
             password    => $fields[PASS],
             vhost       => "/",
             channel_max => 1024,
-        });
+        );
 
-        $r->channel_open($channel);
+        $r->channel_open(channel => $channel);
 
-        $r->basic_qos($channel, {
+        $r->basic_qos(
+            channel        => $channel,
             prefetch_count => 1,
-            prefetch_size  => 0,
-            global         => 0,
-        });
+        );
 
-        $r->exchange_declare($channel, $exchange);
-        $r->queue_declare($channel, $queue, {
+        $r->queue_declare(
+            channel     => $channel,
+            queue       => $queue,
             passive     => 0,
             durable     => 1,
             exclusive   => 0,
             auto_delete => 0
-        });
+        );
     };
 
     if ($@ ne "") {

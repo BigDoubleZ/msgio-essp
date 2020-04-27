@@ -37,6 +37,9 @@ sub show_item {
 
     $rec->{to} = [ split(":", $rec->{to}) ];
 
+    my $dt = Mojo::Date->new;
+    $rec->{created_at} = $dt->parse($rec->{created_at})->to_datetime;
+
     $self->render(json => $rec);
 }
 
@@ -74,8 +77,11 @@ sub show_list {
         return;
     }
 
+    my $dt = Mojo::Date->new;
     foreach my $rec (@{$data->{list}}) {
         $rec->{to} = [ split(":", $rec->{to}) ];
+        $rec->{created_at} = $dt->parse($rec->{created_at})->to_datetime;
+
     }
     $self->render(json => $data->{list});
 }
