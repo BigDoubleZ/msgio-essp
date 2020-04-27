@@ -1,0 +1,221 @@
+#!/usr/bin/perl
+use strict;
+use warnings FATAL => 'all';
+
+use Net::RabbitMQ;
+use Mojo::Pg;
+use Mojo::JSON qw(decode_json encode_json);
+use Email::MIME;
+use Email::Sender::Simple qw(sendmail);
+use Email::Sender::Transport::SMTP qw();
+use Data::Dumper;
+
+use constant {
+    USER => 0,
+    PASS => 1,
+    HOST => 2,
+    PORT => 3,
+};
+
+use constant TASK_COUNT_LIMIT => 1000;
+use constant QUERY_ADD_REC => 'insert into records ("id", "sender", "to", "subject", "message") values (?, ?, ?, ?, ?)';
+use constant QUERY_SET_STATUS => 'update records set sent_status = true where id = ?';
+use constant RE_MQ_URL => qr/^amqp:\/\/([a-z]+):([^\@]+)@([^:]+):(\d+)$/;
+
+my $channel = 1;
+
+my $mq_url = $ENV{MQ_URL} // 'amqp://guest:guest@localhost:5672';
+my $exchange = $ENV{MQ_EXCHANGE_NAME} // 'msgio';
+my $queue = $ENV{MQ_QUEUE_NAME} // 'essp';
+my $smtp_host = $ENV{SMTP_HOST};
+my $smtp_port = $ENV{SMTP_PORT};
+my $smtp_user = $ENV{SMTP_USER};
+my $smtp_pass = $ENV{SMTP_PASS};
+my $smtp_sender = $ENV{SMTP_SENDER} // 'sender@example.com';
+my $pg_url = $ENV{PG_URL} // 'postgresql://postgres:pass@localhost:5432/msgio-ess';
+
+my $db;
+my $mq;
+my $task_count;
+
+init();
+serve();
+exit;
+
+sub init {
+    _log("[*] starting");
+    $db = prepare_db() or exit(2);
+    $mq = prepare_mq() or exit(3);
+    $task_count = 0;
+}
+
+sub serve {
+    _log("[*] waiting for tasks");
+    while ($task_count < TASK_COUNT_LIMIT) {
+        process();
+        $task_count++;
+    }
+}
+
+sub process {
+
+    my $rv = {};
+    $mq->consume($channel, $queue, { no_ack => 0, });
+    $rv = $mq->recv();
+
+    my $data = decode_json($rv->{body});
+    _log("[ ] task: received: [$data->{id}]");
+    my $res;
+    eval {
+        $res = $db->query(QUERY_ADD_REC,
+            $data->{id},
+            $data->{sender},
+            join(':', @{$data->{to}}),
+            $data->{subject},
+            $data->{message},
+        );
+    };
+
+    if ($@ ne "") {
+        _log("[!] db: error: $@");
+        return;
+    }
+    $mq->ack($channel, $rv->{delivery_tag}, 0);
+
+    my $posts_completed = post($data);
+    if (defined $posts_completed) {
+        _log("[ ] task: sending ok: [$posts_completed]");
+        eval {
+            $res = $db->query(QUERY_SET_STATUS, $data->{id});
+        };
+
+        if ($@ ne "") {_log("[!] failed to set task status");}
+        else {_log("[ ] task: finished");}
+        return;
+    }
+    else {_log("[!] task: processing error");}
+}
+
+sub prepare_db {
+    my $pg = Mojo::Pg->new($pg_url);
+
+    unless ($pg->db->ping()) {
+        _log("[f] db: connection failed");
+        return undef;
+    }
+
+    return $pg->db;
+}
+
+sub prepare_mq {
+    my $r;
+    eval {
+        $r = Net::RabbitMQ->new;
+
+        my @fields = $mq_url =~ RE_MQ_URL;
+        return undef if scalar @fields < 3;
+
+        $r->connect($fields[HOST], {
+            user        => $fields[USER],
+            password    => $fields[PASS],
+            vhost       => "/",
+            channel_max => 1024,
+        });
+
+        $r->channel_open($channel);
+
+        $r->basic_qos($channel, {
+            prefetch_count => 1,
+            prefetch_size  => 0,
+            global         => 0,
+        });
+
+        $r->exchange_declare($channel, $exchange);
+        $r->queue_declare($channel, $queue, {
+            passive     => 0,
+            durable     => 1,
+            exclusive   => 0,
+            auto_delete => 0
+        });
+    };
+
+    if ($@ ne "") {
+        _log("[f] mq: failed to init connection: $@");
+        return undef;
+    }
+    else {
+        return $r;
+    }
+}
+
+sub post {
+    my $data = shift;
+    my $count = 0;
+
+    for my $addr (@{$data->{to}}) {
+
+        _log("[ ] mail: sending to [$addr]");
+
+        my ($msg, $err) = create_message($smtp_sender, $addr,
+            $data->{subject}, $data->{message});
+
+        return if defined $err;
+
+        my $transport;
+        eval {
+            $transport = Email::Sender::Transport::SMTP->new({
+                host          => $smtp_host,
+                port          => $smtp_port,
+                sasl_username => $smtp_user,
+                sasl_password => $smtp_pass,
+                ssl           => 1,
+            });
+        };
+        if ($@ ne "") {
+            _log("[!] mail: error creating transport: " . $@);
+            return undef;
+        }
+
+        eval {sendmail($msg, { transport => $transport });};
+
+        if ($@ ne "") {
+            # _log("[!] mail: error sending: " . join("\n", split("\n", $@, 2)));   # suppressing debug trace
+            _log("[!] mail: error sending: " . $@);
+            return undef;
+        }
+        $count++;
+    }
+
+    return $count;
+}
+
+sub create_message {
+    my ($from, $to, $subject, $body) = @_;
+
+    my $msg = Email::MIME->create(
+        header_str => [
+            From          => $from,
+            To            => $to,
+            Subject       => $subject,
+            'X-PoweredBy' => "MSGIO-ESSP",
+        ],
+        attributes => {
+            encoding => 'base64',
+            charset  => "UTF-8",
+        },
+        body_str   => $body,
+    );
+
+    unless (defined $msg) {
+        my $err = "[!] mail: error build message";
+        _log($err);
+        return undef, $err;
+    }
+
+    return $msg;
+}
+
+sub _log {
+    my $msg = shift;
+    print STDERR $msg . "\n";
+}
